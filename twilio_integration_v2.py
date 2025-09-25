@@ -1,0 +1,478 @@
+import os
+import logging
+import base64
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
+from google.cloud import speech, texttospeech
+import asyncio
+import uuid
+import json
+from google.adk.runners import Runner
+from dotenv import load_dotenv
+from vertexai import agent_engines
+
+from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
+
+# --------------------------------------------------------------------------------------
+# Basic configuration
+# --------------------------------------------------------------------------------------
+resource_id="<your agent engine resource id>"
+user_id=uuid.uuid4().int
+
+import uvicorn
+
+# Use local credentials file for Google
+os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "<your google application credentials file>"
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+APP_NAME = "ADK Streaming example"
+
+# Connect to remote agent application
+remote_app = agent_engines.get(resource_id)
+
+# Load environment variables
+load_dotenv()
+
+# --- FastAPI app ---
+app = FastAPI()
+
+# --- Google Cloud API clients ---
+speech_client = speech.SpeechAsyncClient()
+tts_client = texttospeech.TextToSpeechAsyncClient()
+
+# --------------------------------------------------------------------------------------
+# Audio/STT/TTS parameters
+# Twilio Media Streams send 8kHz PCMU (mu-law). We match STT and TTS to that for low latency.
+# --------------------------------------------------------------------------------------
+STREAMING_CONFIG = speech.StreamingRecognitionConfig(
+    config=speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.MULAW,
+        sample_rate_hertz=8000,
+        language_code="en-US",
+        enable_automatic_punctuation=True,
+    ),
+    interim_results=True,
+)
+
+# Size of a single frame we send back to Twilio. 160 bytes ≈ 20 ms at 8k PCMU.
+PCMU_FRAME_BYTES = 160
+
+# --------------------------------------------------------------------------------------
+# Session creation for the agent engine
+# --------------------------------------------------------------------------------------
+def create_session(user_id: str) -> None:
+    """Create a new agent session for a given user."""
+    remote_session = remote_app.create_session(user_id=user_id, state={"user_authenticated": 0})
+    print("Created session:", remote_session)
+    return remote_session['id']
+
+session_id=create_session(str(user_id))
+
+# --------------------------------------------------------------------------------------
+# Basic health route
+# --------------------------------------------------------------------------------------
+@app.get("/", response_class=JSONResponse)
+async def index_page():
+    """Health check endpoint to verify server is up."""
+    return {"message": "Twilio Media Stream Server is running!"}
+
+# --------------------------------------------------------------------------------------
+# Twilio webhook to start the media stream
+# --------------------------------------------------------------------------------------
+@app.api_route("/incoming-call", methods=["GET", "POST"])
+async def handle_incoming_call(request: Request):
+    """Return TwiML instructing Twilio to open a media stream to our WebSocket."""
+    # Get caller information from Twilio webhook parameters
+    form_data = await request.form()
+    caller_number = form_data.get("From", "Unknown")
+    called_number = form_data.get("To", "Unknown")
+    call_sid = form_data.get("CallSid", "Unknown")
+    
+    logging.info(f"Incoming call from: {caller_number} to: {called_number} (CallSid: {call_sid})")
+    
+    response = VoiceResponse()
+    response.say(
+        "Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Google S. T. T., Google A. D. K. and Google T. T. S. APIs",
+        voice="Google.en-US-Chirp3-HD-Aoede"
+    )
+    # Intentionally avoid extra pause for lower startup latency
+    response.say(
+        "O.K. you can start talking!",
+        voice="Google.en-US-Chirp3-HD-Aoede"
+    )
+    host = request.url.hostname
+    connect = Connect()
+    connect.stream(url=f'wss://{host}/media-stream')
+    response.append(connect)
+    return HTMLResponse(content=str(response), media_type="application/xml")
+
+# --------------------------------------------------------------------------------------
+# TTS helper
+# --------------------------------------------------------------------------------------
+async def synthesize_speech_for_response(text: str) -> str:
+    """Synthesize text to 8kHz PCMU and return it as base64 string."""
+    logging.info(f"Synthesizing speech for: {text}")
+    synthesis_input = texttospeech.SynthesisInput(text=text)
+    voice = texttospeech.VoiceSelectionParams(
+        language_code="en-US", ssml_gender=texttospeech.SsmlVoiceGender.FEMALE
+    )
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.MULAW,
+        sample_rate_hertz=8000,
+    )
+
+    response = await tts_client.synthesize_speech(
+        input=synthesis_input, voice=voice, audio_config=audio_config
+    )
+    return base64.b64encode(response.audio_content).decode('utf-8')
+
+# Add this function to send clear command to Twilio
+async def clear_twilio_audio(websocket: WebSocket, stream_sid: str):
+    """Send clear command to Twilio to stop current audio playback."""
+    if stream_sid and websocket.client_state.name == 'CONNECTED':
+        try:
+            clear_command = {
+                "event": "clear",
+                "streamSid": stream_sid
+            }
+            await websocket.send_json(clear_command)
+            logging.info("Sent clear command to Twilio")
+        except Exception as e:
+            logging.error(f"Error sending clear command: {e}")
+
+async def stream_tts_with_interruption(websocket: WebSocket, stream_sid: str, text: str, interrupt_flag: asyncio.Event) -> bool:
+    """Stream TTS audio with immediate interruption capability."""
+    if not stream_sid or websocket.client_state.name != 'CONNECTED':
+        return False
+    
+    try:
+        # Synthesize the full audio first
+        bot_audio_b64_full = await synthesize_speech_for_response(text)
+        bot_audio_bytes = base64.b64decode(bot_audio_b64_full)
+        
+        sent = False
+        # Stream in very small chunks for immediate interruption
+        chunk_size = 80  # ~10ms chunks for faster interruption
+        for i in range(0, len(bot_audio_bytes), chunk_size):
+            # Check for interruption before each chunk
+            if interrupt_flag.is_set():
+                logging.info("TTS interrupted by user speech - sending clear command")
+                # Send clear command to stop audio playback
+                await clear_twilio_audio(websocket, stream_sid)
+                break
+            if websocket.client_state.name != 'CONNECTED':
+                break
+                
+            frame = bot_audio_bytes[i:i+chunk_size]
+            audio_delta = {
+                "event": "media",
+                "streamSid": stream_sid,
+                "media": {
+                    "payload": base64.b64encode(frame).decode('utf-8')
+                }
+            }
+            await websocket.send_json(audio_delta)
+            sent = True
+            
+            # Very small delay to allow frequent interruption checks
+            await asyncio.sleep(0.005)  # 5ms delay between chunks
+            
+        return sent
+    except Exception as e:
+        logging.error(f"Error sending TTS frames: {e}")
+        return False
+
+async def send_delayed_filler(websocket: WebSocket, stream_sid: str, delay_seconds: float, text: str, interrupt_flag: asyncio.Event):
+    """After a delay, speak a short filler if not cancelled (for slow agent responses)."""
+    try:
+        await asyncio.sleep(delay_seconds)
+        if stream_sid and websocket.client_state.name == 'CONNECTED' and not interrupt_flag.is_set():
+            await stream_tts_with_interruption(websocket, stream_sid, text, interrupt_flag)
+    except asyncio.CancelledError:
+        # Normal path when agent responds before timeout
+        return
+    except Exception as e:
+        logging.error(f"Error in delayed filler: {e}")
+
+# --------------------------------------------------------------------------------------
+# Optional API for testing TTS independently
+# --------------------------------------------------------------------------------------
+@app.post("/api/tts")
+async def text_to_speech(request: Request):
+    """Convert posted text to base64 audio using the same TTS settings used for calls."""
+    data = await request.json()
+    text_to_synthesize = data.get("text", "")
+    audio_base64 = await synthesize_speech_for_response(text_to_synthesize)
+    return {"audio_content": audio_base64}
+
+# --------------------------------------------------------------------------------------
+# WebSocket endpoint used by Twilio Media Streams
+# --------------------------------------------------------------------------------------
+@app.websocket("/media-stream")
+async def websocket_stt_endpoint(websocket: WebSocket):
+    """Bidirectional audio+text processing for the voice conversation with Twilio."""
+    # Twilio requires the audio.twilio.com subprotocol
+    await websocket.accept(subprotocol="audio.twilio.com")
+    logging.info("WebSocket STT connection accepted.")
+
+    audio_queue = asyncio.Queue()
+    stream_sid = None
+    latest_media_timestamp = 0
+    mark_queue = []
+    response_start_timestamp_twilio = None
+    
+    # Interruption handling based on Google STT interim results
+    current_tts_task = None
+    current_agent_task = None
+    interrupt_flag = asyncio.Event()
+    last_interim_time = 0
+    interim_silence_threshold = 1.0  # seconds of silence before considering speech ended
+
+    async def receive_from_twilio():
+        """Receive media and control events from Twilio and enqueue audio for STT."""
+        nonlocal stream_sid, latest_media_timestamp
+        try:
+            async for message in websocket.iter_text():
+                data = json.loads(message)
+                event_type = data.get('event')
+                if event_type == 'media':
+                    latest_media_timestamp = int(data['media']['timestamp'])
+                    audio_chunk_b64 = data['media']['payload']
+                    # Push base64-encoded audio frames to the queue; decode in the generator
+                    await audio_queue.put(audio_chunk_b64)
+                elif event_type == 'start':
+                    stream_sid = data['start']['streamSid']
+                    logging.info(f"Incoming stream has started {stream_sid}")
+                    # Reset per-stream state
+                    response_start_timestamp_twilio = None
+                    latest_media_timestamp = 0
+                    last_assistant_item = None
+                    interrupt_flag.clear()
+                    last_interim_time = 0
+                elif event_type == 'mark':
+                    if mark_queue:
+                        mark_queue.pop(0)
+        except WebSocketDisconnect:
+            logging.info("Twilio disconnected the WebSocket.")
+            await audio_queue.put(None)
+        except RuntimeError as e:
+            logging.error(f"WebSocket runtime error: {e}")
+            await audio_queue.put(None)
+
+    async def process_agent_response(user_final_text: str, websocket: WebSocket, stream_sid: str, interrupt_flag: asyncio.Event):
+        """Process agent response with interruption support."""
+        nonlocal current_tts_task, current_agent_task
+        
+        try:
+            # Clear any previous interruption flag
+            interrupt_flag.clear()
+
+            # Kick off a delayed filler in case the agent response is slow
+            filler_task = asyncio.create_task(
+                send_delayed_filler(
+                    websocket,
+                    stream_sid,
+                    delay_seconds=0.5,  # 500ms = 0.5 seconds
+                    text="Just a moment while I process your request.",
+                    interrupt_flag=interrupt_flag
+                )
+            )
+
+            response_sent = False  # Flag to prevent duplicate responses
+            filler_cancelled = False  # Ensure we cancel filler only once
+
+            for event in remote_app.stream_query(
+                    user_id=user_id,
+                    session_id=session_id,
+                    message=user_final_text,
+            ):
+                # Check for interruption before processing each agent event
+                if interrupt_flag.is_set():
+                    logging.info("Agent processing interrupted by user speech")
+                    break
+                    
+                try:
+                    # Extract text from agent event payload with better error handling
+                    if 'content' in event and 'parts' in event['content'] and len(event['content']['parts']) > 0:
+                        if 'text' in event['content']['parts'][0]:
+                            res = event['content']['parts'][0]['text']
+                            logging.info(f"Generated bot response: {res}")
+
+                            # Now that we have actual assistant text, cancel filler if pending (only once)
+                            if not filler_cancelled and not filler_task.done():
+                                filler_task.cancel()
+                                try:
+                                    await filler_task
+                                except asyncio.CancelledError:
+                                    pass
+                                filler_cancelled = True
+
+                            # Check if WebSocket is still connected and user is not speaking
+                            if websocket.client_state.name == 'CONNECTED' and not interrupt_flag.is_set():
+                                # Stream TTS back to Twilio with immediate interruption capability
+                                current_tts_task = asyncio.create_task(
+                                    stream_tts_with_interruption(websocket, stream_sid, res, interrupt_flag)
+                                )
+                                bot_sent = await current_tts_task
+                                if bot_sent and not response_sent:
+                                    response_sent = True
+
+                        else:
+                            logging.warning("No 'text' field found in agent response parts")
+                    else:
+                        logging.warning("Unexpected agent response structure")
+
+                except Exception as e:
+                    # Cancel filler if pending and send fallback response only once
+                    if not filler_cancelled and not filler_task.done():
+                        filler_task.cancel()
+                        try:
+                            await filler_task
+                        except asyncio.CancelledError:
+                            pass
+                    filler_cancelled = True
+                    
+                    if not response_sent and websocket.client_state.name == 'CONNECTED' and not interrupt_flag.is_set():
+                        logging.error(f"Agent response error: {e}")
+                        current_tts_task = asyncio.create_task(
+                            stream_tts_with_interruption(websocket, stream_sid, "Sure, give me a moment", interrupt_flag)
+                        )
+                        await current_tts_task
+                        response_sent = True
+                        
+        except asyncio.CancelledError:
+            logging.info("Agent processing was cancelled due to user interruption")
+            # Cancel any pending filler
+            if 'filler_task' in locals() and not filler_task.done():
+                filler_task.cancel()
+        except Exception as e:
+            logging.error(f"Error in agent processing: {e}")
+
+    async def run_agent_and_send_response():
+        """Stream audio to Google STT, send transcript to agent, TTS reply back to Twilio.
+        Continues handling multiple user turns until Twilio closes the WebSocket.
+        """
+        nonlocal stream_sid, response_start_timestamp_twilio, current_tts_task, current_agent_task, interrupt_flag, last_interim_time
+        # Track last processed final transcript to avoid duplicate agent calls
+        last_final_transcript = ""
+        last_final_media_ts_ms = -1
+
+        async def audio_generator():
+            """Async generator feeding Google STT with initial config then audio frames."""
+            # Send config first
+            yield speech.StreamingRecognizeRequest(streaming_config=STREAMING_CONFIG)
+            while True:
+                chunk_b64 = await audio_queue.get()
+                if chunk_b64 is None:
+                    break
+                # Twilio sends base64 PCMU frames; decode to raw bytes for Google STT
+                yield speech.StreamingRecognizeRequest(audio_content=base64.b64decode(chunk_b64))
+
+        try:
+            # Stream recognition responses
+            responses = await speech_client.streaming_recognize(requests=audio_generator())
+
+            async for response in responses:
+                if not response.results:
+                    continue
+                result = response.results[0]
+                if not result.alternatives:
+                    continue
+
+                transcript = (result.alternatives[0].transcript or "").strip()
+
+                # Handle interim results for interruption detection
+                if not result.is_final:
+                    if transcript and len(transcript.strip()) > 0:
+                        # User is speaking - interrupt current TTS and agent processing
+                        current_time = latest_media_timestamp / 1000.0  # Convert to seconds
+                        
+                        # Only interrupt if we have a meaningful interim result and enough time has passed
+                        if (current_time - last_interim_time) > 0.1:  # 100ms debounce
+                            logging.info(f"User speaking (interim): {transcript} - interrupting TTS and agent")
+                            interrupt_flag.set()
+                            last_interim_time = current_time
+                            
+                            # Send clear command to stop current audio
+                            await clear_twilio_audio(websocket, stream_sid)
+                            
+                            # Cancel current TTS task
+                            if current_tts_task and not current_tts_task.done():
+                                current_tts_task.cancel()
+                            
+                            # Cancel current agent processing task
+                            if current_agent_task and not current_agent_task.done():
+                                current_agent_task.cancel()
+                                logging.info("Cancelled ongoing agent processing due to interim speech")
+                    continue
+
+                # Handle final results
+                if result.is_final:
+                    # Clear interruption flag when we get a final result
+                    interrupt_flag.clear()
+                    
+                    # Ignore empty final transcripts
+                    if not transcript:
+                        logging.info("Final transcript was empty; skipping agent call.")
+                        continue
+                    # Debounce identical finals within 1.2s (likely STT duplicate); allow later repeats
+                    current_media_ts_ms = latest_media_timestamp or 0
+                    duplicate_within_window = (
+                        transcript == last_final_transcript and
+                        last_final_media_ts_ms >= 0 and
+                        (current_media_ts_ms - last_final_media_ts_ms) < 1200
+                    )
+                    if duplicate_within_window:
+                        logging.info("Duplicate final transcript within debounce window; skipping agent call.")
+                        continue
+                    # Record this final as processed
+                    last_final_transcript = transcript
+                    last_final_media_ts_ms = current_media_ts_ms
+
+                    logging.info(f"Final transcript received: {transcript}")
+
+                    # Cancel any ongoing agent processing
+                    if current_agent_task and not current_agent_task.done():
+                        current_agent_task.cancel()
+                        logging.info("Cancelled previous agent processing for new user input")
+
+                    # Start new agent processing task
+                    current_agent_task = asyncio.create_task(
+                        process_agent_response(transcript, websocket, stream_sid, interrupt_flag)
+                    )
+                    
+                    # Wait for the agent processing to complete or be interrupted
+                    try:
+                        await current_agent_task
+                    except asyncio.CancelledError:
+                        logging.info("Agent processing was cancelled")
+                    except Exception as e:
+                        logging.error(f"Error in agent processing task: {e}")
+                        
+        except Exception as e:
+            logging.error(f"Error during Google STT processing: {e}")
+        finally:
+            # Do not close the WebSocket; Twilio controls stream lifecycle
+            logging.info("STT processing finished for this turn.")
+
+    # Run receiver and agent/STT tasks concurrently
+    await asyncio.gather(receive_from_twilio(), run_agent_and_send_response())
+
+
+if __name__=="__main__":
+    # export GOOGLE_APPLICATION_CREDENTIALS="./testvertexbot-1a0b45623d70.json"
+    uvicorn.run("main_twilio:app", host="0.0.0.0", port=5050, loop="uvloop", http="httptools", ws="websockets")
+
+# --------------------------------------------------------------------------------------
+# Startup warm-up: pre-initialize TTS to reduce first-response latency
+# --------------------------------------------------------------------------------------
+@app.on_event("startup")
+async def warm_up_tts():
+    try:
+        _ = await synthesize_speech_for_response(".")
+        logging.info("TTS warm-up completed")
+    except Exception as e:
+        logging.warning(f"TTS warm-up failed: {e}")
