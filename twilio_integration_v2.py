@@ -8,6 +8,7 @@ from google.cloud import speech, texttospeech
 import asyncio
 import uuid
 import json
+from datetime import datetime
 from google.adk.runners import Runner
 from dotenv import load_dotenv
 from vertexai import agent_engines
@@ -18,7 +19,6 @@ from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
 # Basic configuration
 # --------------------------------------------------------------------------------------
 resource_id="<your agent engine resource id>"
-user_id=uuid.uuid4().int
 
 import uvicorn
 
@@ -44,8 +44,61 @@ speech_client = speech.SpeechAsyncClient()
 tts_client = texttospeech.TextToSpeechAsyncClient()
 
 # --------------------------------------------------------------------------------------
+# In-Memory Call and Session Management
+# --------------------------------------------------------------------------------------
+# Global dictionary to store call information
+call_registry = {}
+
+def create_call_session(call_sid: str, caller_number: str, called_number: str):
+    """Create a new agent session for a specific call."""
+    try:
+        # Generate unique user_id for this call
+        user_id = str(uuid.uuid4())
+        
+        # Create session with the agent engine
+        remote_session = remote_app.create_session(
+            user_id=user_id, 
+            state={"user_authenticated": 0, "caller_number": caller_number}
+        )
+        session_id = remote_session['id']
+        
+        # Store call information in memory
+        call_info = {
+            "call_sid": call_sid,
+            "caller_number": caller_number,
+            "called_number": called_number,
+            "user_id": user_id,
+            "session_id": session_id,
+            "created_at": datetime.now().isoformat(),
+            "status": "active"
+        }
+        
+        # Add to global registry
+        call_registry[call_sid] = call_info
+        
+        logging.info(f"Created session for call {call_sid}: user_id={user_id}, session_id={session_id}")
+        return user_id, session_id, call_info
+        
+    except Exception as e:
+        logging.error(f"Error creating call session: {e}")
+        return None, None, None
+
+def get_call_session(call_sid: str):
+    """Get session information for a specific call."""
+    return call_registry.get(call_sid)
+
+def update_call_status(call_sid: str, status: str):
+    """Update call status in registry."""
+    if call_sid in call_registry:
+        call_registry[call_sid]["status"] = status
+        call_registry[call_sid]["updated_at"] = datetime.now().isoformat()
+
+def get_all_calls():
+    """Get all calls from registry."""
+    return call_registry
+
+# --------------------------------------------------------------------------------------
 # Audio/STT/TTS parameters
-# Twilio Media Streams send 8kHz PCMU (mu-law). We match STT and TTS to that for low latency.
 # --------------------------------------------------------------------------------------
 STREAMING_CONFIG = speech.StreamingRecognitionConfig(
     config=speech.RecognitionConfig(
@@ -59,17 +112,6 @@ STREAMING_CONFIG = speech.StreamingRecognitionConfig(
 
 # Size of a single frame we send back to Twilio. 160 bytes ≈ 20 ms at 8k PCMU.
 PCMU_FRAME_BYTES = 160
-
-# --------------------------------------------------------------------------------------
-# Session creation for the agent engine
-# --------------------------------------------------------------------------------------
-def create_session(user_id: str) -> None:
-    """Create a new agent session for a given user."""
-    remote_session = remote_app.create_session(user_id=user_id, state={"user_authenticated": 0})
-    print("Created session:", remote_session)
-    return remote_session['id']
-
-session_id=create_session(str(user_id))
 
 # --------------------------------------------------------------------------------------
 # Basic health route
@@ -93,6 +135,17 @@ async def handle_incoming_call(request: Request):
     
     logging.info(f"Incoming call from: {caller_number} to: {called_number} (CallSid: {call_sid})")
     
+    # Create session for this specific call
+    user_id, session_id, call_info = create_call_session(call_sid, caller_number, called_number)
+    
+    if not user_id or not session_id:
+        logging.error(f"Failed to create session for call {call_sid}")
+        response = VoiceResponse()
+        response.say("Sorry, there was an error setting up your call. Please try again later.")
+        return HTMLResponse(content=str(response), media_type="application/xml")
+    
+    logging.info(f"Session created successfully: {call_info}")
+    
     response = VoiceResponse()
     response.say(
         "Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Google S. T. T., Google A. D. K. and Google T. T. S. APIs",
@@ -105,7 +158,9 @@ async def handle_incoming_call(request: Request):
     )
     host = request.url.hostname
     connect = Connect()
-    connect.stream(url=f'wss://{host}/media-stream')
+    # Pass call_sid as custom parameter to WebSocket
+    stream = connect.stream(url=f'wss://{host}/media-stream')
+    stream.parameter(name='call_sid', value=call_sid)
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
 
@@ -216,13 +271,21 @@ async def websocket_stt_endpoint(websocket: WebSocket):
     """Bidirectional audio+text processing for the voice conversation with Twilio."""
     # Twilio requires the audio.twilio.com subprotocol
     await websocket.accept(subprotocol="audio.twilio.com")
-    logging.info("WebSocket STT connection accepted.")
+    
+    logging.info(f"WebSocket STT connection accepted, waiting for start event with call_sid...")
 
     audio_queue = asyncio.Queue()
     stream_sid = None
     latest_media_timestamp = 0
     mark_queue = []
     response_start_timestamp_twilio = None
+    
+    # These will be set after receiving the start event with call_sid
+    call_sid = None
+    user_id = None
+    session_id = None
+    caller_number = None
+    call_info = None
     
     # Interruption handling based on Google STT interim results
     current_tts_task = None
@@ -233,7 +296,7 @@ async def websocket_stt_endpoint(websocket: WebSocket):
 
     async def receive_from_twilio():
         """Receive media and control events from Twilio and enqueue audio for STT."""
-        nonlocal stream_sid, latest_media_timestamp
+        nonlocal stream_sid, latest_media_timestamp, call_sid, user_id, session_id, caller_number, call_info
         try:
             async for message in websocket.iter_text():
                 data = json.loads(message)
@@ -245,21 +308,45 @@ async def websocket_stt_endpoint(websocket: WebSocket):
                     await audio_queue.put(audio_chunk_b64)
                 elif event_type == 'start':
                     stream_sid = data['start']['streamSid']
-                    logging.info(f"Incoming stream has started {stream_sid}")
+                    # Get call_sid from custom parameters
+                    custom_params = data['start'].get('customParameters', {})
+                    call_sid = custom_params.get('call_sid', 'unknown')
+                    
+                    logging.info(f"Incoming stream has started {stream_sid} for call {call_sid}")
+                    
+                    # Get session information for this call
+                    call_info = get_call_session(call_sid)
+                    if not call_info:
+                        logging.error(f"No session found for call {call_sid}")
+                        await websocket.close()
+                        return
+                    
+                    user_id = call_info["user_id"]
+                    session_id = call_info["session_id"]
+                    caller_number = call_info["caller_number"]
+                    
+                    logging.info(f"Using session - user_id: {user_id}, session_id: {session_id}, caller: {caller_number}")
+                    
                     # Reset per-stream state
                     response_start_timestamp_twilio = None
                     latest_media_timestamp = 0
                     last_assistant_item = None
                     interrupt_flag.clear()
                     last_interim_time = 0
+                    # Update call status to streaming
+                    update_call_status(call_sid, "streaming")
                 elif event_type == 'mark':
                     if mark_queue:
                         mark_queue.pop(0)
         except WebSocketDisconnect:
-            logging.info("Twilio disconnected the WebSocket.")
+            logging.info(f"Twilio disconnected the WebSocket for call {call_sid if call_sid else 'unknown'}")
+            if call_sid:
+                update_call_status(call_sid, "disconnected")
             await audio_queue.put(None)
         except RuntimeError as e:
-            logging.error(f"WebSocket runtime error: {e}")
+            logging.error(f"WebSocket runtime error for call {call_sid if call_sid else 'unknown'}: {e}")
+            if call_sid:
+                update_call_status(call_sid, "error")
             await audio_queue.put(None)
 
     async def process_agent_response(user_final_text: str, websocket: WebSocket, stream_sid: str, interrupt_flag: asyncio.Event):
@@ -459,7 +546,44 @@ async def websocket_stt_endpoint(websocket: WebSocket):
             logging.info("STT processing finished for this turn.")
 
     # Run receiver and agent/STT tasks concurrently
-    await asyncio.gather(receive_from_twilio(), run_agent_and_send_response())
+    try:
+        await asyncio.gather(receive_from_twilio(), run_agent_and_send_response())
+    finally:
+        # Update call status when WebSocket closes
+        if call_sid:
+            update_call_status(call_sid, "ended")
+            logging.info(f"Call {call_sid} session ended")
+
+# Add API endpoints to view call registry
+@app.get("/api/calls")
+async def get_call_registry():
+    """Get current call registry."""
+    return {"calls": call_registry, "total_calls": len(call_registry)}
+
+@app.get("/api/calls/{call_sid}")
+async def get_call_info(call_sid: str):
+    """Get information for a specific call."""
+    call_info = get_call_session(call_sid)
+    if call_info:
+        return call_info
+    else:
+        return {"error": "Call not found"}
+
+@app.delete("/api/calls/{call_sid}")
+async def clear_call(call_sid: str):
+    """Remove a call from registry."""
+    if call_sid in call_registry:
+        del call_registry[call_sid]
+        return {"message": f"Call {call_sid} removed from registry"}
+    else:
+        return {"error": "Call not found"}
+
+@app.delete("/api/calls")
+async def clear_all_calls():
+    """Clear all calls from registry."""
+    global call_registry
+    call_registry.clear()
+    return {"message": "All calls cleared from registry"}
 
 
 if __name__=="__main__":
