@@ -16,7 +16,7 @@ from vertexai import agent_engines
 
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
 
-from initial_state import default_state
+# from initial_state import default_state
 
 # --------------------------------------------------------------------------------------
 # Basic configuration
@@ -452,111 +452,181 @@ async def websocket_stt_endpoint(websocket: WebSocket):
     async def run_agent_and_send_response():
         """Stream audio to Google STT, send transcript to agent, TTS reply back to Twilio.
         Continues handling multiple user turns until Twilio closes the WebSocket.
+        Handles automatic stream restart to avoid Google's 305-second limit.
         """
         nonlocal stream_sid, response_start_timestamp_twilio, current_tts_task, current_agent_task, interrupt_flag, last_interim_time
         # Track last processed final transcript to avoid duplicate agent calls
         last_final_transcript = ""
         last_final_media_ts_ms = -1
-
-        async def audio_generator():
-            """Async generator feeding Google STT with initial config then audio frames."""
-            # Send config first
-            yield speech.StreamingRecognizeRequest(streaming_config=STREAMING_CONFIG)
-            while True:
-                chunk_b64 = await audio_queue.get()
-                if chunk_b64 is None:
-                    break
-                # Twilio sends base64 PCMU frames; decode to raw bytes for Google STT
-                yield speech.StreamingRecognizeRequest(audio_content=base64.b64decode(chunk_b64))
-
-        try:
-            # Stream recognition responses
-            responses = await speech_client.streaming_recognize(requests=audio_generator())
-
-            async for response in responses:
-                if not response.results:
-                    continue
-                result = response.results[0]
-                if not result.alternatives:
-                    continue
-
-                transcript = (result.alternatives[0].transcript or "").strip()
-
-                # Handle interim results for interruption detection
-                if not result.is_final:
-                    if transcript and len(transcript.strip()) > 0:
-                        # User is speaking - interrupt current TTS and agent processing
-                        current_time = latest_media_timestamp / 1000.0  # Convert to seconds
-                        
-                        # Only interrupt if we have a meaningful interim result and enough time has passed
-                        if (current_time - last_interim_time) > 0.1:  # 100ms debounce
-                            logging.info(f"User speaking (interim): {transcript} - interrupting TTS and agent")
-                            interrupt_flag.set()
-                            last_interim_time = current_time
-                            
-                            # Send clear command to stop current audio
-                            await clear_twilio_audio(websocket, stream_sid)
-                            
-                            # Cancel current TTS task
-                            if current_tts_task and not current_tts_task.done():
-                                current_tts_task.cancel()
-                            
-                            # Cancel current agent processing task
-                            if current_agent_task and not current_agent_task.done():
-                                current_agent_task.cancel()
-                                logging.info("Cancelled ongoing agent processing due to interim speech")
-                    continue
-
-                # Handle final results
-                if result.is_final:
-                    # Clear interruption flag when we get a final result
-                    interrupt_flag.clear()
+        
+        # Maximum stream duration: restart before hitting Google's 305s limit
+        MAX_STREAM_DURATION = 290  # seconds (leave 15s buffer before 305s limit)
+        MAX_RESTARTS = 50  # Maximum number of stream restarts (allows ~4 hours of call time)
+        
+        restart_count = 0
+        
+        while restart_count < MAX_RESTARTS:  # Loop to handle stream restarts with safety limit
+            stream_start_time = asyncio.get_event_loop().time()
+            stream_ended = False
+            restart_count += 1
+            
+            logging.info(f"Starting Google STT stream (restart #{restart_count})")
+            
+            async def audio_generator():
+                """Async generator feeding Google STT with initial config then audio frames."""
+                nonlocal stream_ended
+                # Send config first
+                yield speech.StreamingRecognizeRequest(streaming_config=STREAMING_CONFIG)
+                
+                while True:
+                    # Check if WebSocket is still connected
+                    if websocket.client_state.name != 'CONNECTED':
+                        logging.info("WebSocket disconnected, ending audio stream")
+                        stream_ended = True
+                        break
                     
-                    # Ignore empty final transcripts
-                    if not transcript:
-                        logging.info("Final transcript was empty; skipping agent call.")
-                        continue
-                    # Debounce identical finals within 1.2s (likely STT duplicate); allow later repeats
-                    current_media_ts_ms = latest_media_timestamp or 0
-                    duplicate_within_window = (
-                        transcript == last_final_transcript and
-                        last_final_media_ts_ms >= 0 and
-                        (current_media_ts_ms - last_final_media_ts_ms) < 1200
-                    )
-                    if duplicate_within_window:
-                        logging.info("Duplicate final transcript within debounce window; skipping agent call.")
-                        continue
-                    # Record this final as processed
-                    last_final_transcript = transcript
-                    last_final_media_ts_ms = current_media_ts_ms
-
-                    logging.info(f"Final transcript received: {transcript}")
-
-                    # Cancel any ongoing agent processing
-                    if current_agent_task and not current_agent_task.done():
-                        current_agent_task.cancel()
-                        logging.info("Cancelled previous agent processing for new user input")
-
-                    # Start new agent processing task
-                    current_agent_task = asyncio.create_task(
-                        process_agent_response(transcript, websocket, stream_sid, interrupt_flag)
-                    )
+                    # Check if we need to end this stream due to duration limit
+                    elapsed = asyncio.get_event_loop().time() - stream_start_time
+                    if elapsed >= MAX_STREAM_DURATION:
+                        logging.info(f"Stream duration limit reached ({elapsed:.1f}s), ending stream for restart")
+                        stream_ended = True
+                        break
                     
-                    # Wait for the agent processing to complete or be interrupted
                     try:
-                        await current_agent_task
-                    except asyncio.CancelledError:
-                        logging.info("Agent processing was cancelled")
-                    except Exception as e:
-                        logging.error(f"Error in agent processing task: {e}")
-                        logging.error(traceback.format_exc())
+                        # Use timeout to periodically check stream duration
+                        chunk_b64 = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
+                        if chunk_b64 is None:
+                            # WebSocket closed (None is pushed by receive_from_twilio on disconnect)
+                            logging.info("Received None from audio queue, ending stream")
+                            stream_ended = True
+                            break
+                        # Twilio sends base64 PCMU frames; decode to raw bytes for Google STT
+                        yield speech.StreamingRecognizeRequest(audio_content=base64.b64decode(chunk_b64))
+                    except asyncio.TimeoutError:
+                        # No audio received in 1 second, continue checking (normal for silence)
+                        continue
 
-        except Exception as e:
-            logging.error(f"Error during Google STT processing: {e}")
-            logging.error(traceback.format_exc())
-        finally:
-            # Do not close the WebSocket; Twilio controls stream lifecycle
-            logging.info("STT processing finished for this turn.")
+            try:
+                # Stream recognition responses
+                responses = await speech_client.streaming_recognize(requests=audio_generator())
+
+                async for response in responses:
+                    if not response.results:
+                        continue
+                    result = response.results[0]
+                    if not result.alternatives:
+                        continue
+
+                    transcript = (result.alternatives[0].transcript or "").strip()
+
+                    # Handle interim results for interruption detection
+                    if not result.is_final:
+                        if transcript and len(transcript.strip()) > 0:
+                            # User is speaking - interrupt current TTS and agent processing
+                            current_time = latest_media_timestamp / 1000.0  # Convert to seconds
+                            
+                            # Only interrupt if we have a meaningful interim result and enough time has passed
+                            if (current_time - last_interim_time) > 0.1:  # 100ms debounce
+                                logging.info(f"User speaking (interim): {transcript} - interrupting TTS and agent")
+                                interrupt_flag.set()
+                                last_interim_time = current_time
+                                
+                                # Send clear command to stop current audio
+                                await clear_twilio_audio(websocket, stream_sid)
+                                
+                                # Cancel current TTS task
+                                if current_tts_task and not current_tts_task.done():
+                                    current_tts_task.cancel()
+                                
+                                # Cancel current agent processing task
+                                if current_agent_task and not current_agent_task.done():
+                                    current_agent_task.cancel()
+                                    logging.info("Cancelled ongoing agent processing due to interim speech")
+                        continue
+
+                    # Handle final results
+                    if result.is_final:
+                        # Clear interruption flag when we get a final result
+                        interrupt_flag.clear()
+                        
+                        # Ignore empty final transcripts
+                        if not transcript:
+                            logging.info("Final transcript was empty; skipping agent call.")
+                            continue
+                        # Debounce identical finals within 1.2s (likely STT duplicate); allow later repeats
+                        current_media_ts_ms = latest_media_timestamp or 0
+                        duplicate_within_window = (
+                            transcript == last_final_transcript and
+                            last_final_media_ts_ms >= 0 and
+                            (current_media_ts_ms - last_final_media_ts_ms) < 1200
+                        )
+                        if duplicate_within_window:
+                            logging.info("Duplicate final transcript within debounce window; skipping agent call.")
+                            continue
+                        # Record this final as processed
+                        last_final_transcript = transcript
+                        last_final_media_ts_ms = current_media_ts_ms
+
+                        logging.info(f"Final transcript received: {transcript}")
+
+                        # Cancel any ongoing agent processing
+                        if current_agent_task and not current_agent_task.done():
+                            current_agent_task.cancel()
+                            logging.info("Cancelled previous agent processing for new user input")
+
+                        # Start new agent processing task
+                        current_agent_task = asyncio.create_task(
+                            process_agent_response(transcript, websocket, stream_sid, interrupt_flag)
+                        )
+                        
+                        # Wait for the agent processing to complete or be interrupted
+                        try:
+                            await current_agent_task
+                        except asyncio.CancelledError:
+                            logging.info("Agent processing was cancelled")
+                        except Exception as e:
+                            logging.error(f"Error in agent processing task: {e}")
+                            logging.error(traceback.format_exc())
+
+            except Exception as e:
+                if "OutOfRange" in str(type(e).__name__) or "Exceeded maximum allowed stream duration" in str(e):
+                    logging.warning(f"Stream duration limit reached, restarting stream: {e}")
+                    # Continue to restart the stream
+                else:
+                    logging.error(f"Error during Google STT processing: {e}")
+                    logging.error(traceback.format_exc())
+                    # For other errors, break the loop
+                    break
+            
+            # Check if we should restart the stream or exit
+            if stream_ended:
+                # Check if WebSocket is still connected
+                if websocket.client_state.name != 'CONNECTED':
+                    logging.info("WebSocket closed, exiting STT processing")
+                    break
+                
+                # Check if call is ended
+                if call_sid:
+                    call_info = get_call_session(call_sid)
+                    if call_info and call_info.get("status") in ["disconnected", "ended", "error"]:
+                        logging.info(f"Call {call_sid} ended, exiting STT processing")
+                        break
+                
+                # Check if we've hit the restart limit
+                if restart_count >= MAX_RESTARTS:
+                    logging.warning(f"Maximum restart limit ({MAX_RESTARTS}) reached, ending STT processing")
+                    break
+                
+                # Otherwise, restart the stream
+                logging.info(f"Restarting Google STT stream to continue session (restart {restart_count}/{MAX_RESTARTS})")
+                await asyncio.sleep(0.1)  # Brief pause before restart
+                continue
+            else:
+                # Unexpected exit, break the loop
+                logging.info("Stream ended unexpectedly, exiting STT processing")
+                break
+        
+        logging.info("STT processing finished.")
 
     # Run receiver and agent/STT tasks concurrently
     try:
