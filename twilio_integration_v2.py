@@ -1,5 +1,6 @@
 import os
 import logging
+import traceback
 import base64
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -15,15 +16,18 @@ from vertexai import agent_engines
 
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
 
+from initial_state import default_state
+
 # --------------------------------------------------------------------------------------
 # Basic configuration
 # --------------------------------------------------------------------------------------
+# Load environment variables
+load_dotenv()
 resource_id="<your agent engine resource id>"
-
 import uvicorn
 
 # Use local credentials file for Google
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "<your google application credentials file>"
+# os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "<your google application credentials file>"
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -32,9 +36,6 @@ APP_NAME = "ADK Streaming example"
 
 # Connect to remote agent application
 remote_app = agent_engines.get(resource_id)
-
-# Load environment variables
-load_dotenv()
 
 # --- FastAPI app ---
 app = FastAPI()
@@ -140,20 +141,23 @@ async def handle_incoming_call(request: Request):
     
     if not user_id or not session_id:
         logging.error(f"Failed to create session for call {call_sid}")
+        logging.error(traceback.format_exc())
         response = VoiceResponse()
         response.say("Sorry, there was an error setting up your call. Please try again later.")
         return HTMLResponse(content=str(response), media_type="application/xml")
     
     logging.info(f"Session created successfully: {call_info}")
+    initial_message = "O.K. you can start talking!"
+    
     
     response = VoiceResponse()
     response.say(
-        "Please wait while we connect your call to the A. I. voice assistant, powered by Twilio and the Google S. T. T., Google A. D. K. and Google T. T. S. APIs",
+        "Please wait while we connect your call to the A. I. voice assistant, powered by the Google S. T. T., Google A. D. K. and Google T. T. S. APIs",
         voice="Google.en-US-Chirp3-HD-Aoede"
     )
     # Intentionally avoid extra pause for lower startup latency
     response.say(
-        "O.K. you can start talking!",
+        initial_message,
         voice="Google.en-US-Chirp3-HD-Aoede"
     )
     host = request.url.hostname
@@ -197,6 +201,7 @@ async def clear_twilio_audio(websocket: WebSocket, stream_sid: str):
             logging.info("Sent clear command to Twilio")
         except Exception as e:
             logging.error(f"Error sending clear command: {e}")
+            logging.error(traceback.format_exc())
 
 async def stream_tts_with_interruption(websocket: WebSocket, stream_sid: str, text: str, interrupt_flag: asyncio.Event) -> bool:
     """Stream TTS audio with immediate interruption capability."""
@@ -238,6 +243,7 @@ async def stream_tts_with_interruption(websocket: WebSocket, stream_sid: str, te
         return sent
     except Exception as e:
         logging.error(f"Error sending TTS frames: {e}")
+        logging.error(traceback.format_exc())
         return False
 
 async def send_delayed_filler(websocket: WebSocket, stream_sid: str, delay_seconds: float, text: str, interrupt_flag: asyncio.Event):
@@ -251,6 +257,7 @@ async def send_delayed_filler(websocket: WebSocket, stream_sid: str, delay_secon
         return
     except Exception as e:
         logging.error(f"Error in delayed filler: {e}")
+        logging.error(traceback.format_exc())
 
 # --------------------------------------------------------------------------------------
 # Optional API for testing TTS independently
@@ -345,6 +352,7 @@ async def websocket_stt_endpoint(websocket: WebSocket):
             await audio_queue.put(None)
         except RuntimeError as e:
             logging.error(f"WebSocket runtime error for call {call_sid if call_sid else 'unknown'}: {e}")
+            logger.error(traceback.format_exc())
             if call_sid:
                 update_call_status(call_sid, "error")
             await audio_queue.put(None)
@@ -408,11 +416,13 @@ async def websocket_stt_endpoint(websocket: WebSocket):
                                     response_sent = True
 
                         else:
-                            logging.warning("No 'text' field found in agent response parts")
+                            logging.info("No 'text' field found in agent response parts")
                     else:
-                        logging.warning("Unexpected agent response structure")
+                        logging.info("Unexpected agent response structure")
 
                 except Exception as e:
+                    logging.error(f"Error processing agent response: {e}")
+                    logging.error(traceback.format_exc())
                     # Cancel filler if pending and send fallback response only once
                     if not filler_cancelled and not filler_task.done():
                         filler_task.cancel()
@@ -437,6 +447,7 @@ async def websocket_stt_endpoint(websocket: WebSocket):
                 filler_task.cancel()
         except Exception as e:
             logging.error(f"Error in agent processing: {e}")
+            logging.error(traceback.format_exc())
 
     async def run_agent_and_send_response():
         """Stream audio to Google STT, send transcript to agent, TTS reply back to Twilio.
@@ -538,9 +549,11 @@ async def websocket_stt_endpoint(websocket: WebSocket):
                         logging.info("Agent processing was cancelled")
                     except Exception as e:
                         logging.error(f"Error in agent processing task: {e}")
-                        
+                        logging.error(traceback.format_exc())
+
         except Exception as e:
             logging.error(f"Error during Google STT processing: {e}")
+            logging.error(traceback.format_exc())
         finally:
             # Do not close the WebSocket; Twilio controls stream lifecycle
             logging.info("STT processing finished for this turn.")
@@ -588,7 +601,7 @@ async def clear_all_calls():
 
 if __name__=="__main__":
     # export GOOGLE_APPLICATION_CREDENTIALS="./testvertexbot-1a0b45623d70.json"
-    uvicorn.run("main_twilio:app", host="0.0.0.0", port=5050, loop="uvloop", http="httptools", ws="websockets")
+    uvicorn.run("twilio_integration_v2:app", host="0.0.0.0", port=5050, loop="uvloop", http="httptools", ws="websockets")
 
 # --------------------------------------------------------------------------------------
 # Startup warm-up: pre-initialize TTS to reduce first-response latency
